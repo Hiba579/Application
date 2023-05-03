@@ -4,6 +4,7 @@ import headers
 import threading
 import sys
 import os
+import queue
 
 parser = argparse.ArgumentParser(description="TCP connection that can run in server and client mode")
 
@@ -32,10 +33,10 @@ if args.server:
     print("ip: ", args.bind, " port: ", args.port)
     data, addr = serverSocket.recvfrom(buffer)
     print("Received file: ", data.strip())
-    f = open("test.jpg", "wb")
+    f = open("test2.jpg", "wb")
 
     # Receive the file size and send an ACK
-    file_size = int(data.strip())
+    file_size = len(data)
     serverSocket.sendto(b"ACK", addr)
     print("File size received:", file_size)
 
@@ -43,10 +44,9 @@ if args.server:
     # written to the file
     packets_buffer = []
 
-
     # Create a thread to handle ACKs sent by the client
     def ack_handler():
-        packets_buffer = []
+
         while True:
             try:
                 # Wait for an ACK packet from the client
@@ -64,7 +64,6 @@ if args.server:
                 print("Timeout waiting for ACK, resending packets")
                 for packet in packets_buffer:
                     serverSocket.sendto(packet[1], addr)
-
 
     # Start the ACK handler thread
     threading.Thread(target=ack_handler, daemon=True).start()
@@ -93,77 +92,35 @@ if args.server:
             print("Adding packet", seq, "to buffer")
             queue.append((seq, packet))
 
-            while not queue.empty() and queue.queue[0][0] == queue.qsize():
-                f.write(queue.get()[1][12:])
-                f.flush()
+# Loop to receive packets and write them to the file
+queue = []
+while True:
+    packet, addr = serverSocket.recvfrom(1024)
+    seq, _, flags, _ = headers.parse_header(packet[:12])
 
-    # Close the file and socket
-    f.close()
-    serverSocket.close()
+    # Send an ACK for the packet
+    ack_packet = headers.create_packet(seq, 0, headers.ACK_FLAG, 0, b'')
+    serverSocket.sendto(ack_packet, addr)
 
+    # If the packet is the next one expected, write it to the file and
+    # continue sending the remaining packets
+    if seq == len(queue) + 1:
+        print("Received packet", seq)
+        queue.append((seq, packet))
+        while queue and queue[0][0] == len(queue):
+            f.write(queue.pop(0)[1][12:])
+            f.flush()
 
-if args.client:
-    addr = (args.bind, args.port)
-    client_socket = socket(AF_INET, SOCK_DGRAM)
-    client_socket.connect((args.bind, args.port))
-    f = open(args.file, "rb")
-    filedata = f.read(buffer)
-    print(filedata)
-    client_socket.sendto(args.file.encode(), addr)
-    file_size = os.path.getsize(args.file)
-    print(file_size)
-    print(f)
-    print("connected to host")
+    # If the packet is not the next one expected, add it to the buffer
+    elif seq > len(queue):
+        print("Adding packet", seq, "to buffer")
+        queue.append((seq, packet))
 
-    # Implementing Go-Back-N (GBN) protocol
-    window_size = 5  # Fixed window size of 5 packets
-    seq_num = 1  # Sequence number of first packet
-    packets = []  # List to store the packets
-    ack_received = True  # Flag to check if ACK is received or not
+        # Check if any packets in the buffer can now be written to the file
+        while queue and queue[0][0] == len(queue):
+            f.write(queue.pop(0)[1][12:])
+            f.flush()
 
-    # Sending first window of packets
-    for i in range(window_size):
-        packet = headers.create_packet(seq_num, 0, 0, 0, filedata)
-        packets.append(packet)
-        if client_socket.sendto(packet, addr):
-            filedata = f.read(buffer)
-            if not filedata:
-                break
-            seq_num += 1
-
-    while True:
-        # Receiving ACKs
-        client_socket.settimeout(0.5)
-        try:
-            ack, _ = client_socket.recvfrom(buffer)
-            ack_seq_num = headers.parse_header(ack)[1]
-            print(f"Received ACK for packet {ack_seq_num}")
-            ack_received = True
-        except timeout:
-            print("Timeout occurred, resending packets")
-            ack_received = False
-
-        # Resending packets if ACK not received
-        if not ack_received:
-            for packet in packets:
-                client_socket.sendto(packet, addr)
-                print(f"Resending packet {headers.parse_header(packet)[0]}")
-            continue
-
-        # Moving the window and sending new packets
-        packets.pop(0)
-        packet = headers.create_packet(seq_num, 0, 0, 0, filedata)
-        packets.append(packet)
-        if client_socket.sendto(packet, addr):
-            filedata = f.read(buffer)
-            if not filedata:
-                break
-            seq_num += 1
-
-        # Exiting the loop if all packets are sent
-        if not packets:
-            break
-
-    # recvMsg = client_socket.recv(buffer)
-    # print(recvMsg)
-    client_socket.close()
+# Close the file and socket
+f.close()
+serverSocket.close()
