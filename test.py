@@ -1,126 +1,158 @@
 import argparse
-from socket import *
-import headers
-import threading
-import sys
 import os
-import queue
+import random
+import select
+import socket
+import struct
+import sys
+import threading
+import time
 
-parser = argparse.ArgumentParser(description="TCP connection that can run in server and client mode")
+# Constants
+HEADER_LENGTH = 12
+MAX_PACKET_SIZE = 1472
+MAX_WINDOW_SIZE = 64
+TIMEOUT = 1
 
-parser.add_argument('-s', '--server', action='store_true')
-parser.add_argument('-c', '--client', action='store_true')
-parser.add_argument('-b', '--bind', type=str)
-parser.add_argument('-p', '--port', type=int)
-parser.add_argument('-f', '--file', type=str)
+# Flags
+SYN_FLAG = 0b1000
+ACK_FLAG = 0b0100
+FIN_FLAG = 0b0010
+RST_FLAG = 0b0001
 
-args = parser.parse_args()
 
-header_format = '!IIHH'
-buffer = 1460
+def create_packet(seq_num, ack_num, flags, window_size, data):
+    header = struct.pack('!IIHH', seq_num, ack_num, flags, window_size)
+    packet = header + data
+    return packet
 
-if args.server and args.client:
-    print("Can't run server and client at the same time")
-    sys.exit()
 
-if not args.server and not args.client:
-    print("You have to start in either client or server mode")
-    sys.exit()
+def parse_header(packet):
+    header = packet[:HEADER_LENGTH]
+    seq_num, ack_num, flags, window_size = struct.unpack('!IIHH', header)
+    return seq_num, ack_num, flags, window_size
 
-if args.server:
-    serverSocket = socket(AF_INET, SOCK_DGRAM)
-    serverSocket.bind((args.bind, args.port))
-    print("ip: ", args.bind, " port: ", args.port)
-    data, addr = serverSocket.recvfrom(buffer)
-    print("Received file: ", data.strip())
-    f = open("test2.jpg", "wb")
 
-    # Receive the file size and send an ACK
-    file_size = len(data)
-    serverSocket.sendto(b"ACK", addr)
-    print("File size received:", file_size)
+def DRPTClient(ip, port, file, reliable, test_case):
+    pass
 
-    # Create a buffer to hold packets that have been received but not yet
-    # written to the file
-    packets_buffer = []
 
-    # Create a thread to handle ACKs sent by the client
-    def ack_handler():
+class Receiver:
+    def __init__(self, ip_address, port, file_name, reliable_method):
+        self.ip_address = ip_address
+        self.port = port
+        self.file_name = file_name
+        self.reliable_method = reliable_method
+        self.file = None
+        self.next_seq_num = 1
+        self.expected_ack_num = 1
+        self.recv_buffer = []
+        self.recv_buffer_lock = threading.Lock()
+        self.recv_window = MAX_WINDOW_SIZE
+        self.sender_address = None
+        self.sender_window_size = 0
+        self.sender_address_lock = threading.Lock()
+        self.timer = None
+        self.timer_lock = threading.Lock()
 
+        # Create UDP socket
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind((ip_address, port))
+
+    def receive(self):
         while True:
-            try:
-                # Wait for an ACK packet from the client
-                ack_packet, addr = serverSocket.recvfrom(1024)
-                ack_seq, _, ack_flags, _ = headers.parse_header(ack_packet[:12])
+            packet, address = self.socket.recvfrom(MAX_PACKET_SIZE)
 
-                # If the ACK is for the next packet in the buffer, remove it
-                # from the buffer and continue sending the remaining packets
-                if ack_seq == packets_buffer[0][0]:
-                    print("Received ACK for packet", ack_seq)
-                    packets_buffer.pop(0)
-            except timeout:
-                # If the thread times out waiting for an ACK, retransmit the
-                # packets in the buffer
-                print("Timeout waiting for ACK, resending packets")
-                for packet in packets_buffer:
-                    serverSocket.sendto(packet[1], addr)
+            # Parse header and data from packet
+            seq_num, ack_num, flags, window_size = parse_header(packet)
+            data = packet[HEADER_LENGTH:]
 
-    # Start the ACK handler thread
-    threading.Thread(target=ack_handler, daemon=True).start()
+            if flags & RST_FLAG:
+                print('Connection reset by peer')
+                self.close()
+                break
 
-    # Loop to receive packets and write them to the file
-    queue = []
-    while True:
-        packet, addr = serverSocket.recvfrom(1024)
-        seq, _, flags, _ = headers.parse_header(packet[:12])
+            if flags & SYN_FLAG:
+                # New connection request
+                print('Received SYN from', address)
+                self.sender_address = address
+                self.sender_window_size = window_size
+                ack_packet = create_packet(0, seq_num + 1, SYN_FLAG | ACK_FLAG, MAX_WINDOW_SIZE, b'')
+                self.socket.sendto(ack_packet, address)
+                print('Sent SYN-ACK to', address)
+            elif flags & ACK_FLAG:
+                # Handle ACK packet
+                print('Received ACK', ack_num, 'from', address)
+                if ack_num > self.next_seq_num:
+                    print('Unexpected ACK number')
+                    continue
 
-        # Send an ACK for the packet
-        ack_packet = headers.create_packet(seq, 0, headers.ACK_FLAG, 0, b'')
-        serverSocket.sendto(ack_packet, addr)
+                if ack_num == self.next_seq_num:
+                    # Stop timer
+                    with self.timer_lock:
+                        if self.timer is not None:
+                            self.timer.cancel()
+                            self.timer = None
 
-        # If the packet is the next one expected, write it to the file and
-        # continue sending the remaining packets
-        if seq == len(queue) + 1:
-            print("Received packet", seq)
-            queue.append((seq, packet))
-            while queue and queue[0][0] == len(queue):
-                f.write(queue.pop(0)[1][12:])
-                f.flush()
+                    # Update receive buffer and expected ACK number
+                    with self.recv_buffer_lock:
+                        self.recv_buffer.append((seq_num, data))
+                        self.recv_buffer.sort(key=lambda x: x[0])
+                        while self.recv_buffer and self.recv_buffer[0][0] == self.expected_ack_num:
+                            self.file.write(self.recv_buffer.pop(0)[1])
+                            self.expected_ack_num += 1
+                            self.recv_window += 1
 
-        # If the packet is not the next one expected, add it to the buffer
-        elif seq > len(queue):
-            print("Adding packet", seq, "to buffer")
-            queue.append((seq, packet))
+                            # Send ACK for received packet
+                            ack_packet = create_packet(0, ack_num, ACK_FLAG, self.recv_window, b'')
+                            self.socket.sendto(ack_packet, address)
+                            print('Sent ACK for packet', seq_num)
 
-# Loop to receive packets and write them to the file
-queue = []
-while True:
-    packet, addr = serverSocket.recvfrom(1024)
-    seq, _, flags, _ = headers.parse_header(packet[:12])
+                            # If received packet is the expected packet
+                            if seq_num == self.expected_seq:
+                                self.expected_seq += 1
+                                self.buffer.append(packet[12:])
 
-    # Send an ACK for the packet
-    ack_packet = headers.create_packet(seq, 0, headers.ACK_FLAG, 0, b'')
-    serverSocket.sendto(ack_packet, addr)
+                                # Write all packets in the buffer that are in order
+                                while self.buffer and self.buffer[0]:
+                                    self.file.write(self.buffer.pop(0))
+                                    self.bytes_received += 1460
 
-    # If the packet is the next one expected, write it to the file and
-    # continue sending the remaining packets
-    if seq == len(queue) + 1:
-        print("Received packet", seq)
-        queue.append((seq, packet))
-        while queue and queue[0][0] == len(queue):
-            f.write(queue.pop(0)[1][12:])
-            f.flush()
+                            # If received packet is not the expected packet
+                            else:
+                                self.buffer[seq_num - self.expected_seq - 1] = packet[12:]
 
-    # If the packet is not the next one expected, add it to the buffer
-    elif seq > len(queue):
-        print("Adding packet", seq, "to buffer")
-        queue.append((seq, packet))
+                            # If all packets have been received, close the connection and file
+                            if self.bytes_received == self.file_size:
+                                print('Received file successfully')
+                                self.file.close()
+                                self.socket.close()
+                                sys.exit()
 
-        # Check if any packets in the buffer can now be written to the file
-        while queue and queue[0][0] == len(queue):
-            f.write(queue.pop(0)[1][12:])
-            f.flush()
+                             # If packet is not valid, discard it
+                               #  excep  InvalidPacketError:
+                                     #  pass
 
-# Close the file and socket
-f.close()
-serverSocket.close()
+                def run(self):
+                    # Start the receiving loop in a separate thread
+                    thread = threading.Thread(target=self.receive_loop)
+                    thread.start()
+
+                    # Wait for the thread to finish
+                    thread.join()
+
+            if __name__ == '__main__':
+                # Parse command line arguments
+                parser = argparse.ArgumentParser(description='DRTP file transfer client')
+                parser.add_argument('-i', '--ip', type=str, required=True, help='server IP address')
+                parser.add_argument('-p', '--port', type=int, required=True, help='server port number')
+                parser.add_argument('-f', '--file', type=str, required=True, help='file to transfer')
+                parser.add_argument('-r', '--reliable', type=str, choices=['gbn', 'sr'], default='gbn',
+                                    help='reliable transmission protocol (default: GBN)')
+                parser.add_argument('-t', '--test-case', type=str, default=None,
+                                    help='test case to simulate packet loss (options: loss)')
+                args = parser.parse_args()
+
+                # Create a DRTP client and start the transfer
+                client = DRPTClient(args.ip, args.port, args.file, args.reliable, args.test_case)
+                client.run()
